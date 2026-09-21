@@ -12,6 +12,7 @@
     <Grid.RowDefinitions>
       <RowDefinition Height="Auto" />
       <RowDefinition Height="Auto" />
+      <RowDefinition Height="Auto" />
       <RowDefinition Height="*" />
     </Grid.RowDefinitions>
 
@@ -52,16 +53,35 @@
         <Grid.ColumnDefinitions>
           <ColumnDefinition Width="*" />
           <ColumnDefinition Width="Auto" />
+          <ColumnDefinition Width="Auto" />
         </Grid.ColumnDefinitions>
         <TextBlock x:Name="IndexStatus" Grid.Column="0" FontSize="11"
                    Foreground="{DynamicResource {x:Static SystemColors.GrayTextBrushKey}}"
                    VerticalAlignment="Center" Text="Not indexed. Connect to a server to start." />
-        <Button x:Name="RefreshButton" Grid.Column="1" Content="Refresh" Padding="8,2"
+        <ToggleButton x:Name="ScopeButton" Grid.Column="1" Padding="6,2"
+                      Margin="0,0,4,0"
+                      AutomationProperties.Name="Scope"
+                      ToolTip="Scope — choose which servers and databases to search (Alt+S)">
+          <!-- Segoe MDL2 "Filter" glyph, matching ObjectTypeToIconConverter's icon set.
+               Icon-only, so the automation name above is what a screen reader reads. -->
+          <TextBlock Text="&#xE71C;" FontFamily="Segoe MDL2 Assets" FontSize="12"
+                     VerticalAlignment="Center" />
+        </ToggleButton>
+        <Button x:Name="RefreshButton" Grid.Column="2" Content="Refresh" Padding="8,2"
                 FontSize="11" Click="RefreshButton_Click" />
       </Grid>
     </Border>
 
+    <!-- Scope tree (hidden until the Scope button is toggled on) -->
+    <Border x:Name="ScopePanel" Grid.Row="2"
+            Visibility="{Binding IsChecked, ElementName=ScopeButton, Converter={StaticResource BoolToVis}}"
+            Padding="4,2" BorderThickness="0,0,0,1"
+            BorderBrush="{DynamicResource {x:Static SystemColors.ControlDarkBrushKey}}"
+            Background="{DynamicResource {x:Static SystemColors.ControlBrushKey}}">
+      <controls:ScopeControl x:Name="ScopePanelContent" />
+    </Border>
+
     <!-- Main search control -->
-    <controls:SearchControl x:Name="SearchPanel" Grid.Row="2" />
+    <controls:SearchControl x:Name="SearchPanel" Grid.Row="3" />
   </Grid>
 </UserControl>

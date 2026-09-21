@@ -1,8 +1,11 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
+using CommunityToolkit.Mvvm.Input;
 using Microsoft.VisualStudio.Shell;
 using SqlPilot.Core.Database;
 using SqlPilot.Package.Services;
@@ -20,6 +23,8 @@ namespace SqlPilot.Package
 
         public SearchViewModel ViewModel { get; }
 
+        public ScopeViewModel ScopeViewModel { get; }
+
         public SqlPilotToolWindowControl(SqlPilotPackage package)
         {
             _package = package;
@@ -30,7 +35,26 @@ namespace SqlPilot.Package
             ViewModel.DebounceMs = package.SettingsProvider.GetSettings().SearchDebounceMs;
             SearchPanel.DataContext = ViewModel;
 
+            ScopeViewModel = new ScopeViewModel(package.ScopeStore);
+            ScopeViewModel.ScopeToggled += OnScopeToggled;
+            ScopePanel.DataContext = ScopeViewModel;
+
             SearchPanel.ActionRequested += OnActionRequested;
+
+            // Alt+S toggles the scope panel. Added in code rather than XAML because
+            // InputBindings don't inherit DataContext, so a bound Command wouldn't resolve.
+            InputBindings.Add(new KeyBinding(new RelayCommand(ToggleScopePanel), Key.S, ModifierKeys.Alt));
+        }
+
+        /// <summary>Alt+S — drives the toggle button so button, panel and state stay in sync.</summary>
+        private void ToggleScopePanel()
+        {
+            ScopeButton.IsChecked = ScopeButton.IsChecked != true;
+
+            if (ScopeButton.IsChecked == true)
+                ScopePanelContent.FocusTree();
+            else
+                SearchPanel.FocusSearchBox();
         }
 
         public async Task RefreshIndexAsync()
@@ -38,64 +62,24 @@ namespace SqlPilot.Package
             try
             {
                 IndexStatus.Text = "Indexing...";
-                RefreshButton.IsEnabled = false;
+                SetBusy(true);
 
                 var servers = _package.ObjectExplorerBridge.GetConnectedServerNames();
 
                 if (servers.Count == 0)
                 {
                     IndexStatus.Text = "No servers connected. Select a server in Object Explorer and click Refresh.";
-                    RefreshButton.IsEnabled = true;
                     return;
                 }
 
                 _package.SearchEngine.ClearAll();
-                int totalDatabases = 0;
+                ScopeViewModel.PruneServers(servers);
 
                 foreach (var serverName in servers)
-                {
-                    IndexStatus.Text = $"Connecting to {serverName}...";
+                    await IndexServerAsync(serverName);
 
-                    var connInfo = _package.ObjectExplorerBridge.GetConnectionInfo(serverName);
-                    var smoProvider = new SmoDatabaseObjectProvider(connInfo);
-
-                    IndexStatus.Text = $"Loading databases from {serverName}...";
-                    var databases = await smoProvider.GetDatabaseNamesAsync(serverName);
-
-                    int completedDbs = 0;
-                    IndexStatus.Text = $"Indexing {serverName} (0/{databases.Count})...";
-
-                    // Parallelize database indexing — each SMO call creates its own connection.
-                    // Cap concurrency so we don't exhaust the connection pool on servers with
-                    // hundreds of databases.
-                    using (var throttle = new System.Threading.SemaphoreSlim(20))
-                    {
-                        var dbTasks = databases.Select(async dbName =>
-                        {
-                            await throttle.WaitAsync();
-                            try
-                            {
-                                await Task.Run(() => _package.SearchEngine.RefreshIndexAsync(serverName, dbName, smoProvider));
-                                int done = System.Threading.Interlocked.Increment(ref completedDbs);
-                                // Fire-and-forget status update — no need to await UI thread hop
-                                _ = Dispatcher.BeginInvoke(new Action(() =>
-                                {
-                                    IndexStatus.Text = $"Indexing {serverName} ({done}/{databases.Count}) — {dbName}";
-                                }));
-                            }
-                            finally
-                            {
-                                throttle.Release();
-                            }
-                        }).ToList();
-
-                        await Task.WhenAll(dbTasks);
-                    }
-                    totalDatabases += databases.Count;
-                }
-
-                int objectCount = _package.SearchEngine.GetIndexedObjectCount();
-                IndexStatus.Text = $"Indexed {objectCount:N0} objects in {totalDatabases} database(s) from {servers.Count} server(s).";
+                ScopeViewModel.UpdateSummary();
+                IndexStatus.Text = ScopeViewModel.DescribeIndexStatus(_package.SearchEngine.GetIndexedObjectCount());
 
                 // Re-run any pending search now that the index is populated
                 ViewModel.Rerun();
@@ -107,8 +91,139 @@ namespace SqlPilot.Package
             }
             finally
             {
-                RefreshButton.IsEnabled = true;
+                SetBusy(false);
             }
+        }
+
+        /// <summary>
+        /// Index a set of databases on one server. Parallelized — each SMO call creates
+        /// its own connection — with concurrency capped so we don't exhaust the
+        /// connection pool on servers with hundreds of databases.
+        /// </summary>
+        private async Task IndexDatabasesAsync(
+            string serverName, IDatabaseObjectProvider provider, IReadOnlyList<string> databases)
+        {
+            int completedDbs = 0;
+            IndexStatus.Text = $"Indexing {serverName} (0/{databases.Count})...";
+
+            using (var throttle = new System.Threading.SemaphoreSlim(20))
+            {
+                var dbTasks = databases.Select(async dbName =>
+                {
+                    await throttle.WaitAsync();
+                    try
+                    {
+                        await Task.Run(() => _package.SearchEngine.RefreshIndexAsync(serverName, dbName, provider));
+                        int done = System.Threading.Interlocked.Increment(ref completedDbs);
+                        // Assigned, not posted to the dispatcher: this method is entered
+                        // from the UI thread and nothing here configures the awaits away
+                        // from it, so we are already on it. Posting instead would queue an
+                        // update that could run after the caller writes the final status
+                        // and leave "Indexing ..." on screen for good.
+                        IndexStatus.Text = $"Indexing {serverName} ({done}/{databases.Count}) — {dbName}";
+                    }
+                    finally
+                    {
+                        throttle.Release();
+                    }
+                }).ToList();
+
+                await Task.WhenAll(dbTasks);
+            }
+        }
+
+        private void OnScopeToggled(object sender, ScopeToggleEventArgs e)
+        {
+            _ = ApplyScopeToggleAsync(e);
+        }
+
+        /// <summary>
+        /// Bring the index in line with a scope toggle. Excluding drops the affected
+        /// buckets; including spot-indexes just what came back into scope, so no full
+        /// re-index is needed either way.
+        /// </summary>
+        private async Task ApplyScopeToggleAsync(ScopeToggleEventArgs e)
+        {
+            try
+            {
+                SetBusy(true);
+
+                if (e.DatabaseName == null)
+                {
+                    if (e.Included)
+                        await IndexServerAsync(e.ServerName, ScopeViewModel.GetDatabaseNames(e.ServerName));
+                    else
+                        _package.SearchEngine.ClearServer(e.ServerName);
+                }
+                else
+                {
+                    if (e.Included)
+                        await IndexDatabasesAsync(e.ServerName, CreateProvider(e.ServerName), new[] { e.DatabaseName });
+                    else
+                        _package.SearchEngine.ClearDatabase(e.ServerName, e.DatabaseName);
+                }
+
+                IndexStatus.Text = ScopeViewModel.DescribeIndexStatus(_package.SearchEngine.GetIndexedObjectCount());
+                ViewModel.Rerun();
+            }
+            catch (Exception ex)
+            {
+                IndexStatus.Text = $"Scope update error: {ex.Message}";
+                Debug.WriteLine($"SqlPilot scope error: {ex}");
+            }
+            finally
+            {
+                SetBusy(false);
+            }
+        }
+
+        /// <summary>
+        /// Index every in-scope database on one server. <paramref name="databases"/> lets a
+        /// caller that already knows the list (a scope toggle re-reads it off the tree) skip
+        /// the connect + metadata round trip.
+        /// </summary>
+        private async Task IndexServerAsync(string serverName, IReadOnlyList<string> databases = null)
+        {
+            IndexStatus.Text = $"Connecting to {serverName}...";
+            var provider = CreateProvider(serverName);
+
+            if (databases == null)
+            {
+                // A server that's out of scope and already in the tree doesn't need
+                // re-enumerating — that's the connect the user excluded it to avoid.
+                var known = ScopeViewModel.GetDatabaseNames(serverName);
+                if (known.Count > 0 && !_package.ScopeStore.IsServerIncluded(serverName))
+                {
+                    databases = known;
+                }
+                else
+                {
+                    IndexStatus.Text = $"Loading databases from {serverName}...";
+                    databases = await provider.GetDatabaseNamesAsync(serverName);
+
+                    // Enumerated even for out-of-scope servers we haven't seen yet: one
+                    // cheap metadata query is what keeps the scope tree and the
+                    // "x of y database(s)" status honest. The expensive part — crawling
+                    // each database's objects — is what scope skips.
+                    ScopeViewModel.MergeServer(serverName, databases);
+                }
+            }
+
+            var inScope = databases
+                .Where(db => _package.ScopeStore.IsDatabaseIncluded(serverName, db))
+                .ToList();
+
+            if (inScope.Count > 0)
+                await IndexDatabasesAsync(serverName, provider, inScope);
+        }
+
+        private SmoDatabaseObjectProvider CreateProvider(string serverName)
+            => new SmoDatabaseObjectProvider(_package.ObjectExplorerBridge.GetConnectionInfo(serverName));
+
+        private void SetBusy(bool busy)
+        {
+            RefreshButton.IsEnabled = !busy;
+            ScopePanelContent.SetTreeEnabled(!busy);
         }
 
         private void OnActionRequested(DatabaseObject obj, string action)

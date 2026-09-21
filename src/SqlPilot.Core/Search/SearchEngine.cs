@@ -7,6 +7,7 @@ using System.Threading.Tasks;
 using SqlPilot.Core.Database;
 using SqlPilot.Core.Favorites;
 using SqlPilot.Core.Recents;
+using SqlPilot.Core.Scope;
 
 namespace SqlPilot.Core.Search
 {
@@ -16,11 +17,16 @@ namespace SqlPilot.Core.Search
             new ConcurrentDictionary<string, List<DatabaseObject>>(StringComparer.OrdinalIgnoreCase);
         private readonly IFavoritesStore _favorites;
         private readonly IRecentObjectsStore _recents;
+        private readonly ISearchScopeStore _scope;
 
-        public SearchEngine(IFavoritesStore favorites = null, IRecentObjectsStore recents = null)
+        public SearchEngine(
+            IFavoritesStore favorites = null,
+            IRecentObjectsStore recents = null,
+            ISearchScopeStore scope = null)
         {
             _favorites = favorites;
             _recents = recents;
+            _scope = scope;
         }
 
         public Task<IReadOnlyList<SearchResult>> SearchAsync(
@@ -41,16 +47,19 @@ namespace SqlPilot.Core.Search
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
-                // Skip entire buckets that don't match the filter
-                if (filter.ServerName != null || filter.DatabaseName != null)
+                // Skip entire buckets that are out of scope or don't match the filter.
+                // Parsing the key allocates, so only do it when something will read it.
+                if ((filter.ServerName != null || filter.DatabaseName != null || _scope != null)
+                    && TryParseKey(kvp.Key, out var keyServer, out var keyDatabase))
                 {
-                    if (TryParseKey(kvp.Key, out var keyServer, out var keyDatabase))
-                    {
-                        if (filter.ServerName != null && !string.Equals(keyServer, filter.ServerName, StringComparison.OrdinalIgnoreCase))
-                            continue;
-                        if (filter.DatabaseName != null && !string.Equals(keyDatabase, filter.DatabaseName, StringComparison.OrdinalIgnoreCase))
-                            continue;
-                    }
+                    if (filter.ServerName != null && !string.Equals(keyServer, filter.ServerName, StringComparison.OrdinalIgnoreCase))
+                        continue;
+                    if (filter.DatabaseName != null && !string.Equals(keyDatabase, filter.DatabaseName, StringComparison.OrdinalIgnoreCase))
+                        continue;
+                    // Hosts also drop excluded buckets from the index, so this is the
+                    // backstop for a bucket indexed before the exclusion was made.
+                    if (_scope != null && !_scope.IsDatabaseIncluded(keyServer, keyDatabase))
+                        continue;
                 }
 
                 foreach (var obj in kvp.Value)
@@ -122,6 +131,10 @@ namespace SqlPilot.Core.Search
             IDatabaseObjectProvider provider,
             CancellationToken cancellationToken = default)
         {
+            // The engine owns the scope store, so the guard lives here rather than in
+            // every caller's indexing loop.
+            if (_scope != null && !_scope.IsDatabaseIncluded(serverName, databaseName)) return;
+
             var objects = await provider.GetObjectsAsync(serverName, databaseName, cancellationToken);
             _index[MakeKey(serverName, databaseName)] = objects.ToList();
         }
@@ -135,6 +148,11 @@ namespace SqlPilot.Core.Search
 
             foreach (var key in keysToRemove)
                 _index.TryRemove(key, out _);
+        }
+
+        public void ClearDatabase(string serverName, string databaseName)
+        {
+            _index.TryRemove(MakeKey(serverName, databaseName), out _);
         }
 
         public void ClearAll()

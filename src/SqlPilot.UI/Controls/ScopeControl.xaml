@@ -1,0 +1,60 @@
+<UserControl x:Class="SqlPilot.UI.Controls.ScopeControl"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="clr-namespace:SqlPilot.UI.ViewModels">
+
+  <!-- Deliberately theme-neutral: colours are inherited from the host so SSMS
+       (SystemColors) and the demo (DarkTheme.xaml) each style it their own way.
+       DataContext is a ScopeViewModel. -->
+  <Grid>
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto" />
+      <RowDefinition Height="*" />
+    </Grid.RowDefinitions>
+
+    <TextBlock Grid.Row="0" FontSize="11" Margin="2,0,0,2" Opacity="0.75"
+               Text="{Binding SummaryText}" />
+
+    <TreeView Grid.Row="1" x:Name="ScopeTree"
+              ItemsSource="{Binding Servers}"
+              AutomationProperties.Name="Search scope"
+              MaxHeight="220"
+              BorderThickness="0"
+              Background="Transparent"
+              ScrollViewer.HorizontalScrollBarVisibility="Auto">
+      <TreeView.Resources>
+        <!-- The label is a sibling of the checkbox, so each checkbox needs its own
+             automation name — otherwise a screen reader announces "checkbox, checked"
+             with no idea which server or database. No HelpText: WPF only falls back to
+             ToolTip when HelpText is empty, and the ToolTip is the more useful string. -->
+        <HierarchicalDataTemplate DataType="{x:Type vm:ServerScopeNode}" ItemsSource="{Binding Databases}">
+          <StackPanel Orientation="Horizontal">
+            <CheckBox IsChecked="{Binding IsChecked, Mode=TwoWay}"
+                      IsThreeState="False"
+                      VerticalAlignment="Center"
+                      AutomationProperties.Name="{Binding Name}" />
+            <TextBlock Text="{Binding Name}" Margin="4,0,0,0" FontWeight="SemiBold" />
+          </StackPanel>
+        </HierarchicalDataTemplate>
+        <DataTemplate DataType="{x:Type vm:DatabaseScopeNode}">
+          <StackPanel Orientation="Horizontal">
+            <!-- ToolTip carries the server so two same-named databases stay tellable apart. -->
+            <CheckBox IsChecked="{Binding IsIncluded, Mode=TwoWay}"
+                      VerticalAlignment="Center"
+                      AutomationProperties.Name="{Binding Name}"
+                      ToolTip="{Binding ServerName}" />
+            <TextBlock Text="{Binding Name}" Margin="4,0,0,0" />
+          </StackPanel>
+        </DataTemplate>
+      </TreeView.Resources>
+      <TreeView.ItemContainerStyle>
+        <Style TargetType="TreeViewItem">
+          <Setter Property="IsExpanded" Value="True" />
+          <!-- Without this the item announces its bound type name when arrowed onto.
+               Both node types expose Name, so one setter covers servers and databases. -->
+          <Setter Property="AutomationProperties.Name" Value="{Binding Name}" />
+        </Style>
+      </TreeView.ItemContainerStyle>
+    </TreeView>
+  </Grid>
+</UserControl>
